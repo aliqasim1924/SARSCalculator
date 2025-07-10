@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useEffect, useState } from 'react';
+import React, { createContext, useContext, useEffect, useState, useRef } from 'react';
 import type { User as SupabaseUser, Session } from '@supabase/supabase-js';
 import { supabase } from '../lib/supabase';
 import type { Profile } from '../types';
@@ -8,6 +8,7 @@ interface AuthContextType {
   profile: Profile | null;
   session: Session | null;
   loading: boolean;
+  profileLoading: boolean;
   signIn: (email: string, password: string) => Promise<{ error?: string }>;
   signUp: (email: string, password: string, userData: { full_name: string; company_name: string }) => Promise<{ error?: string }>;
   signOut: () => Promise<void>;
@@ -22,13 +23,27 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [profile, setProfile] = useState<Profile | null>(null);
   const [session, setSession] = useState<Session | null>(null);
   const [loading, setLoading] = useState(true);
+  const [profileLoading, setProfileLoading] = useState(false);
+  const [sessionInitialized, setSessionInitialized] = useState(false);
+  const mountedRef = useRef(true);
 
   useEffect(() => {
     let mounted = true;
+    let timeoutId: NodeJS.Timeout;
+
+    // Set a timeout to prevent infinite loading
+    const loadingTimeout = setTimeout(() => {
+      if (mounted && !sessionInitialized) {
+        console.warn('Session initialization timeout - proceeding without auth');
+        setLoading(false);
+        setSessionInitialized(true);
+      }
+    }, 10000); // 10 second timeout
 
     // Get initial session
     const getInitialSession = async () => {
       try {
+        console.log('Initializing session...');
         const { data: { session }, error } = await supabase.auth.getSession();
         
         if (!mounted) return;
@@ -36,20 +51,28 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         if (error) {
           console.error('Error getting session:', error);
           setLoading(false);
+          setSessionInitialized(true);
           return;
         }
 
+        console.log('Session initialized:', session ? 'Found' : 'None');
         setSession(session);
         setUser(session?.user ?? null);
+        setLoading(false);
+        setSessionInitialized(true);
         
+        // Load profile in background (don't block UI)
         if (session?.user) {
-          await loadProfile(session.user.id);
-        } else {
-          setLoading(false);
+          loadProfile(session.user.id).catch(console.error);
         }
       } catch (error) {
         console.error('Session initialization error:', error);
-        if (mounted) setLoading(false);
+        if (mounted) {
+          setLoading(false);
+          setSessionInitialized(true);
+        }
+      } finally {
+        clearTimeout(loadingTimeout);
       }
     };
 
@@ -67,20 +90,32 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setUser(session?.user ?? null);
       
       if (session?.user) {
-        await loadProfile(session.user.id);
+        // Load profile in background
+        loadProfile(session.user.id).catch(console.error);
       } else {
         setProfile(null);
+        setProfileLoading(false);
+      }
+      
+      // Always ensure loading is false after auth state changes
+      if (sessionInitialized) {
         setLoading(false);
       }
     });
 
     return () => {
       mounted = false;
+      mountedRef.current = false;
+      clearTimeout(loadingTimeout);
       subscription.unsubscribe();
     };
-  }, []);
+  }, [sessionInitialized]);
 
-  const loadProfile = async (userId: string) => {
+  const loadProfile = async (userId: string, retryCount = 0) => {
+    if (!mountedRef.current) return;
+    
+    setProfileLoading(true);
+    
     try {
       const { data, error } = await supabase
         .from('profiles')
@@ -88,15 +123,36 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         .eq('id', userId)
         .single();
 
+      if (!mountedRef.current) return;
+
       if (error) {
         console.error('Error loading profile:', error);
+        
+        // Retry up to 3 times for network errors
+        if (retryCount < 3 && (error.code === 'PGRST301' || error.message.includes('network'))) {
+          console.log(`Retrying profile load (${retryCount + 1}/3)...`);
+          setTimeout(() => loadProfile(userId, retryCount + 1), 1000 * (retryCount + 1));
+          return;
+        }
+        
+        // For other errors, continue without profile
+        console.warn('Profile loading failed, continuing without profile data');
       } else {
         setProfile(data);
       }
     } catch (error) {
-      console.error('Error loading profile:', error);
+      console.error('Profile loading error:', error);
+      
+      // Retry for network errors
+      if (retryCount < 3 && mountedRef.current) {
+        console.log(`Retrying profile load (${retryCount + 1}/3)...`);
+        setTimeout(() => loadProfile(userId, retryCount + 1), 1000 * (retryCount + 1));
+        return;
+      }
     } finally {
-      setLoading(false);
+      if (mountedRef.current) {
+        setProfileLoading(false);
+      }
     }
   };
 
@@ -160,9 +216,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   };
 
   const signOut = async () => {
-    const { error } = await supabase.auth.signOut();
-    if (error) {
-      console.error('Error signing out:', error);
+    try {
+      const { error } = await supabase.auth.signOut();
+      if (error) {
+        console.error('Error signing out:', error);
+      }
+      // Clear local state
+      setUser(null);
+      setProfile(null);
+      setSession(null);
+    } catch (error) {
+      console.error('Sign out error:', error);
     }
   };
 
@@ -200,6 +264,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     profile,
     session,
     loading,
+    profileLoading,
     signIn,
     signUp,
     signOut,
